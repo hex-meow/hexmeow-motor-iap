@@ -9,8 +9,8 @@ use crate::{
     Frame, FrameAssembler, FunctionCode, IapIdentity, PolicyError, ReadyToFlash, MAX_DATA_LEN,
 };
 
-const TX_BASE: u16 = 0x780;
-const RX_BASE: u16 = 0x680;
+pub(crate) const TX_BASE: u16 = 0x780;
+pub(crate) const RX_BASE: u16 = 0x680;
 
 #[derive(Debug, Clone)]
 pub struct CancellationToken {

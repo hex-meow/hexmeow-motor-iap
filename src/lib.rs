@@ -4,6 +4,7 @@ mod artifact;
 mod engine;
 mod identity;
 mod policy;
+mod scan;
 mod wire;
 
 pub use artifact::{ArtifactError, EncryptionMode, ImgArtifact, ImgLimits, IMG_TAG_SIZE};
@@ -15,4 +16,5 @@ pub use policy::{
     AuthorizedTarget, IapPolicy, PolicyError, PreparedUpgrade, ReadyToFlash, RegisteredTarget,
     SupportPolicy, TargetClassification, TargetRegistry,
 };
+pub use scan::{scan_all, scan_for_bootloaders, BootloaderHit, ScanError};
 pub use wire::{Frame, FrameAssembler, FrameError, FunctionCode, MAX_DATA_LEN};
