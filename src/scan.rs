@@ -22,6 +22,10 @@ const ACK_ID_MASK: u16 = 0x780;
 /// Probes to send before pausing, matching the flash path's transmit pacing.
 const PROBE_BURST: usize = 4;
 const PROBE_PAUSE: Duration = Duration::from_millis(1);
+/// How long one probe may spend waiting for room in the transmit queue. A full
+/// sweep has to fit inside a bootloader window, so this is far shorter than the
+/// transport's own back-pressure tolerance.
+const PROBE_SEND_TIMEOUT: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Error)]
 pub enum ScanError {
@@ -64,6 +68,44 @@ impl BootloaderHit {
     }
 }
 
+/// What one sweep observed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanReport {
+    hits: Vec<BootloaderHit>,
+    probed: usize,
+    unsent: usize,
+}
+
+impl ScanReport {
+    pub fn hits(&self) -> &[BootloaderHit] {
+        &self.hits
+    }
+
+    pub fn into_hits(self) -> Vec<BootloaderHit> {
+        self.hits
+    }
+
+    pub fn probed(&self) -> usize {
+        self.probed
+    }
+
+    /// Probes that could not even be handed to the bus.
+    pub fn unsent(&self) -> usize {
+        self.unsent
+    }
+
+    /// Not one probe reached the wire.
+    ///
+    /// A CAN controller needs some other node to acknowledge each frame, so a
+    /// bus whose only device is unpowered or hung cannot transmit at all: the
+    /// first frame retransmits forever and the queue never drains. Reporting
+    /// that as "no bootloader answered" would be misleading — nothing was
+    /// asked.
+    pub fn nothing_acknowledging(&self) -> bool {
+        self.probed > 0 && self.unsent == self.probed
+    }
+}
+
 /// Probe `nodes` and collect every bootloader that answers within `listen`.
 ///
 /// `Enter_Iap_Req` is the only request safe to probe with: it erases nothing,
@@ -78,7 +120,7 @@ pub async fn scan_for_bootloaders(
     bus: &dyn CanBus,
     nodes: impl IntoIterator<Item = u8>,
     listen: Duration,
-) -> Result<Vec<BootloaderHit>, ScanError> {
+) -> Result<ScanReport, ScanError> {
     let probes = nodes
         .into_iter()
         .map(|node_id| {
@@ -96,13 +138,22 @@ pub async fn scan_for_bootloaders(
             ScanError::Transport(format!("subscribing to the answer range: {error}"))
         })?;
 
+    let mut unsent = 0usize;
     for (index, (node_id, probe)) in probes.iter().enumerate() {
         let tx_id = TX_BASE + *node_id as u16;
         for chunk in probe.encode().chunks(8) {
-            // Best-effort: most addresses have nothing behind them, and a bus
-            // holding only the device being hunted may not acknowledge at all.
-            if let Ok(frame) = can_transport::CanFrame::new_data(tx_id, chunk) {
-                let _ = bus.send(frame).await;
+            // Best-effort, and deliberately impatient. Most addresses have
+            // nothing behind them, and the device being hunted may be the only
+            // one on the bus, in which case nothing acknowledges and the
+            // transport's back-pressure wait would stall this sweep for far
+            // longer than a bootloader window lasts. Give up on a frame quickly
+            // and rely on sweeping again.
+            let Ok(frame) = can_transport::CanFrame::new_data(tx_id, chunk) else {
+                continue;
+            };
+            match tokio::time::timeout(PROBE_SEND_TIMEOUT, bus.send(frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => unsent += 1,
             }
         }
         if (index + 1) % PROBE_BURST == 0 {
@@ -158,11 +209,15 @@ pub async fn scan_for_bootloaders(
     }
 
     hits.sort_by_key(|hit| hit.node_id);
-    Ok(hits)
+    Ok(ScanReport {
+        hits,
+        probed: probes.len(),
+        unsent,
+    })
 }
 
 /// Probe every addressable node. Node 0 is the reserved broadcast address.
-pub async fn scan_all(bus: &dyn CanBus, listen: Duration) -> Result<Vec<BootloaderHit>, ScanError> {
+pub async fn scan_all(bus: &dyn CanBus, listen: Duration) -> Result<ScanReport, ScanError> {
     scan_for_bootloaders(bus, 1..=127, listen).await
 }
 
@@ -277,7 +332,8 @@ mod tests {
             (7, identity_payload(0xAAAA_0001, 0x2025_1025, 10)),
             (42, identity_payload(0xAAAA_0002, 0x2025_1209, 3)),
         ]);
-        let hits = scan_all(&bus, Duration::from_millis(50)).await.unwrap();
+        let report = scan_all(&bus, Duration::from_millis(50)).await.unwrap();
+        let hits = report.hits();
         assert_eq!(
             hits.iter().map(|hit| hit.node_id()).collect::<Vec<_>>(),
             vec![7, 42]
@@ -285,6 +341,9 @@ mod tests {
         assert_eq!(hits[0].identity().unwrap().current_version(), 10);
         assert_eq!(hits[1].identity().unwrap().device_id(), 0xAAAA_0002);
         assert!(hits.iter().all(BootloaderHit::has_application));
+        assert_eq!(report.probed(), 127);
+        assert_eq!(report.unsent(), 0);
+        assert!(!report.nothing_acknowledging());
     }
 
     #[tokio::test]
@@ -293,7 +352,8 @@ mod tests {
         // is the one a recovery scan exists to find, so it must not be skipped
         // just because the payload does not parse as an identity.
         let bus = FakeBus::new(vec![(9, vec![0xFF; 12])]);
-        let hits = scan_all(&bus, Duration::from_millis(50)).await.unwrap();
+        let report = scan_all(&bus, Duration::from_millis(50)).await.unwrap();
+        let hits = report.hits();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].node_id(), 9);
         assert!(!hits[0].has_application());
@@ -303,8 +363,53 @@ mod tests {
     #[tokio::test]
     async fn a_silent_bus_yields_nothing_rather_than_failing() {
         let bus = FakeBus::new(Vec::new());
-        let hits = scan_all(&bus, Duration::from_millis(20)).await.unwrap();
-        assert!(hits.is_empty());
+        let report = scan_all(&bus, Duration::from_millis(20)).await.unwrap();
+        assert!(report.hits().is_empty());
+        // Probes went out and simply went unanswered, which is a different
+        // condition from not being able to transmit at all.
+        assert!(!report.nothing_acknowledging());
+    }
+
+    #[tokio::test]
+    async fn a_bus_that_cannot_transmit_is_not_reported_as_no_answer() {
+        // An unpowered or hung sole device leaves the controller with nothing
+        // to acknowledge its frames, so nothing is ever asked. Saying "no
+        // bootloader answered" would send someone hunting the wrong fault.
+        // The subscription itself stays healthy on a real dead bus, so hold the
+        // sender: dropping it would make recv fail for a reason the hardware
+        // never produces.
+        #[derive(Default)]
+        struct DeadBus {
+            keepalive: Mutex<Option<mpsc::UnboundedSender<CanFrame>>>,
+        }
+
+        #[async_trait]
+        impl CanBus for DeadBus {
+            async fn send(&self, _frame: CanFrame) -> Result<(), CanIoError> {
+                Err(CanIoError::Disconnected)
+            }
+
+            async fn subscribe(&self, _filter: CanFilter) -> Result<Box<dyn CanRx>, CanIoError> {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                *self.keepalive.lock().unwrap() = Some(sender);
+                Ok(Box::new(FakeRx { receiver }))
+            }
+
+            fn capabilities(&self) -> CanCapabilities {
+                CanCapabilities {
+                    fd: false,
+                    max_dlen: 8,
+                }
+            }
+        }
+
+        let report = scan_all(&DeadBus::default(), Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(report.hits().is_empty());
+        assert_eq!(report.probed(), 127);
+        assert_eq!(report.unsent(), 127);
+        assert!(report.nothing_acknowledging());
     }
 
     #[tokio::test]
