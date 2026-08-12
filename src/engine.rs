@@ -75,6 +75,7 @@ pub struct FlashOptions {
     pub final_timeout: Duration,
     pub verify_timeout: Duration,
     pub reset_attempts: u8,
+    /// CAN frames to hand the transport before pausing for `tx_burst_pause`.
     pub tx_burst_frames: usize,
     pub tx_burst_pause: Duration,
 }
@@ -97,7 +98,16 @@ impl Default for FlashOptions {
             final_timeout: Duration::from_secs(20),
             verify_timeout: Duration::from_secs(20),
             reset_attempts: 2,
-            tx_burst_frames: 15,
+            // 15 frames per millisecond asks for 15000 frames/s. An 8-byte
+            // standard frame costs 111-130 bits with stuffing, so a 1 Mbit/s
+            // link carries at most ~7700-9000 frames/s even when nothing else
+            // is talking: the old default overdrove the bus roughly twofold and
+            // leaned on the queue to absorb it, and a CAN queue is shallow
+            // (txqueuelen defaults to 10, gs_usb adds ~10 in-flight URBs). Four
+            // frames per millisecond stays well under line rate and spreads the
+            // load instead of bursting into a queue that is already full. An
+            // update takes seconds either way.
+            tx_burst_frames: 4,
             tx_burst_pause: Duration::from_millis(1),
         }
     }
