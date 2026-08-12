@@ -6,7 +6,8 @@ use can_transport::{CanBus, CanFilter, CanFrame, CanId, CanRx};
 use thiserror::Error;
 
 use crate::{
-    Frame, FrameAssembler, FunctionCode, IapIdentity, PolicyError, ReadyToFlash, MAX_DATA_LEN,
+    Frame, FrameAssembler, FunctionCode, IapIdentity, IapPolicy, ImgArtifact, PolicyError,
+    ReadyToFlash, RegisteredTarget, SupportPolicy, MAX_DATA_LEN,
 };
 
 pub(crate) const TX_BASE: u16 = 0x780;
@@ -160,6 +161,8 @@ pub enum FlashError {
     IapFirmwareMismatch { expected: u32, actual: u32 },
     #[error("invalid flash options: {0}")]
     InvalidOptions(&'static str),
+    #[error("node id {0} is outside the addressable range 1..=127")]
+    InvalidNode(u8),
 }
 
 impl FlashError {
@@ -248,6 +251,153 @@ where
         &mut on_event,
     )
     .await?;
+    write_artifact(
+        bus,
+        rx.as_mut(),
+        &mut assembler,
+        node_id,
+        policy,
+        artifact,
+        enter_ack,
+        options,
+        cancellation,
+        &mut on_event,
+    )
+    .await
+}
+
+/// Permission to write a device that cannot prove which device it is.
+///
+/// [`flash`] binds an update to one exact unit by requiring a complete CANopen
+/// identity read from the very bus it is about to write. A bootloader implements
+/// no CANopen at all, so a device whose application is gone cannot answer that
+/// read and would otherwise be beyond repair with this crate.
+///
+/// This substitutes the caller's assertion of which profile the device follows,
+/// and substitutes nothing else. The artifact must still satisfy that profile's
+/// policy, and [`recover`] still refuses to write unless the identity the
+/// bootloader reports on entering IAP agrees with both the policy and the
+/// artifact. What is given up is the binding to one specific serial number: the
+/// caller is stating it has identified the device some other way, and is
+/// answerable for that.
+#[derive(Debug, Clone)]
+pub struct AssertedTarget {
+    profile_id: String,
+    policy: IapPolicy,
+    artifact: ImgArtifact,
+}
+
+impl AssertedTarget {
+    /// `target` must come from the caller's own registry, so that asserting a
+    /// profile still cannot invent one.
+    pub fn assert(target: &RegisteredTarget, artifact: ImgArtifact) -> Result<Self, PolicyError> {
+        let SupportPolicy::Enabled(policy) = target.support() else {
+            return Err(PolicyError::ProfileChanged);
+        };
+        policy.validate_artifact(&artifact)?;
+        Ok(Self {
+            profile_id: target.profile_id().to_owned(),
+            policy: policy.clone(),
+            artifact,
+        })
+    }
+
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
+    pub fn artifact(&self) -> &ImgArtifact {
+        &self.artifact
+    }
+}
+
+/// Write a device that answers only the IAP protocol.
+///
+/// Unlike [`flash`] this does not begin with a reset, because a device in this
+/// state is not reliably reachable at all. Measured on hardware whose
+/// application had been erased: it answers only inside the window that follows
+/// its start, keeps acknowledging at the CAN level for a while after that window
+/// closes, and eventually stops acknowledging altogether — by which point even a
+/// reset cannot be transmitted to it. Callers are expected to have knocked the
+/// device into IAP first, which [`scan_for_bootloaders`](crate::scan_for_bootloaders)
+/// does and which is sticky once it takes.
+///
+/// The knock is repeated here anyway. It costs one frame against a device that
+/// is already in IAP, and it is what produces the identity this refuses to write
+/// without.
+pub async fn recover<F>(
+    bus: &dyn CanBus,
+    node_id: u8,
+    target: &AssertedTarget,
+    options: &FlashOptions,
+    cancellation: &CancellationToken,
+    mut on_event: F,
+) -> Result<FlashOutcome, FlashError>
+where
+    F: FnMut(FlashEvent),
+{
+    validate_options(options)?;
+    if !(1..=127).contains(&node_id) {
+        return Err(FlashError::InvalidNode(node_id));
+    }
+    check_cancel(cancellation, FlashStage::EnteringBootloader, false)?;
+    let rx_id = RX_BASE + node_id as u16;
+    let mut rx = bus
+        .subscribe(CanFilter::exact_standard(rx_id))
+        .await
+        .map_err(|error| FlashError::Transport {
+            stage: FlashStage::EnteringBootloader,
+            detail: format!("subscribing to exact ACK ID 0x{rx_id:03X}: {error}"),
+            recovery_required: false,
+        })?;
+    let mut assembler = FrameAssembler::new();
+
+    let enter_ack = knock_into_iap(
+        bus,
+        rx.as_mut(),
+        &mut assembler,
+        node_id,
+        options,
+        cancellation,
+        &mut on_event,
+    )
+    .await?;
+
+    write_artifact(
+        bus,
+        rx.as_mut(),
+        &mut assembler,
+        node_id,
+        &target.policy,
+        &target.artifact,
+        enter_ack,
+        options,
+        cancellation,
+        &mut on_event,
+    )
+    .await
+}
+
+/// Everything from proving the bootloader's identity to the final verify.
+///
+/// Shared by `flash` and `recover`, which differ only in how the device was
+/// brought to this point and in what authorized the write.
+#[allow(clippy::too_many_arguments)]
+async fn write_artifact<F>(
+    bus: &dyn CanBus,
+    rx: &mut dyn CanRx,
+    assembler: &mut FrameAssembler,
+    node_id: u8,
+    policy: &IapPolicy,
+    artifact: &ImgArtifact,
+    enter_ack: Frame,
+    options: &FlashOptions,
+    cancellation: &CancellationToken,
+    on_event: &mut F,
+) -> Result<FlashOutcome, FlashError>
+where
+    F: FnMut(FlashEvent),
+{
     let iap_identity =
         IapIdentity::parse(enter_ack.data()).map_err(|error| FlashError::InvalidIapIdentity {
             detail: error.to_string(),
@@ -264,8 +414,8 @@ where
             actual: iap_identity.firmware_id(),
         });
     }
-    on_event(FlashEvent::Stage(FlashStage::IdentityVerified));
-    on_event(FlashEvent::IapIdentity(iap_identity));
+    (on_event)(FlashEvent::Stage(FlashStage::IdentityVerified));
+    (on_event)(FlashEvent::IapIdentity(iap_identity));
 
     check_cancel(cancellation, FlashStage::StartingDownload, false)?;
     let start = Frame::request(
@@ -276,8 +426,8 @@ where
     .expect("IMG tag fits protocol payload");
     let start_ack = send_with_attempts(
         bus,
-        rx.as_mut(),
-        &mut assembler,
+        &mut *rx,
+        assembler,
         &start,
         AttemptPolicy {
             stage: FlashStage::StartingDownload,
@@ -286,7 +436,7 @@ where
             ambiguous_is_recovery: true,
         },
         options,
-        &mut on_event,
+        on_event,
     )
     .await?;
     // A definitive NAK means the device rejected metadata before erase.
@@ -305,8 +455,8 @@ where
             .expect("chunking respects protocol payload bound");
         let ack = send_with_attempts(
             bus,
-            rx.as_mut(),
-            &mut assembler,
+            &mut *rx,
+            assembler,
             &segment,
             AttemptPolicy {
                 stage: FlashStage::Transferring,
@@ -315,12 +465,12 @@ where
                 ambiguous_is_recovery: true,
             },
             options,
-            &mut on_event,
+            on_event,
         )
         .await?;
         require_success(ack, FlashStage::Transferring, true)?;
         written += chunk.len();
-        on_event(FlashEvent::Progress { written, total });
+        (on_event)(FlashEvent::Progress { written, total });
     }
 
     check_cancel(cancellation, FlashStage::Finalizing, true)?;
@@ -328,8 +478,8 @@ where
         .expect("validated node and protocol constant");
     let final_ack = send_with_attempts(
         bus,
-        rx.as_mut(),
-        &mut assembler,
+        &mut *rx,
+        assembler,
         &final_request,
         AttemptPolicy {
             stage: FlashStage::Finalizing,
@@ -338,7 +488,7 @@ where
             ambiguous_is_recovery: true,
         },
         options,
-        &mut on_event,
+        on_event,
     )
     .await?;
     require_success(final_ack, FlashStage::Finalizing, true)?;
@@ -352,8 +502,8 @@ where
     .expect("IMG tag fits protocol payload");
     let verify_ack = send_with_attempts(
         bus,
-        rx.as_mut(),
-        &mut assembler,
+        &mut *rx,
+        assembler,
         &verify,
         AttemptPolicy {
             stage: FlashStage::Verifying,
@@ -362,7 +512,7 @@ where
             ambiguous_is_recovery: true,
         },
         options,
-        &mut on_event,
+        on_event,
     )
     .await?;
     require_success(verify_ack, FlashStage::Verifying, true)?;
@@ -943,6 +1093,92 @@ mod tests {
                 recovery_required: false,
             }
         ));
+        assert!(bus.requests().is_empty());
+    }
+
+    fn motor_4310() -> RegisteredTarget {
+        RegisteredTarget::enabled(
+            "compatible-motor-4310-v1",
+            0x4859_444C,
+            0xAAAA_0001,
+            IapPolicy::new(0xAAAA_0001, vec![0x2025_1025], 0x1000_C000, true).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn asserted(bin_len: usize) -> AssertedTarget {
+        let bytes = make_image(0xAAAA_0001, 0x2025_1025, 0x1000_C000, bin_len, true);
+        let artifact = ImgArtifact::parse(&bytes, ImgLimits::default()).unwrap();
+        AssertedTarget::assert(&motor_4310(), artifact).unwrap()
+    }
+
+    #[tokio::test]
+    async fn recovery_writes_without_a_reset() {
+        // A device that has stopped acknowledging cannot be sent a reset at all,
+        // so recovery has to start from the knock.
+        let bus = FakeBus::new(None, None);
+        recover(
+            &bus,
+            1,
+            &asserted(300),
+            &fast_options(),
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bus.requests(),
+            vec![
+                FunctionCode::EnterIapRequest,
+                FunctionCode::StartDownloadRequest,
+                FunctionCode::SegmentARequest,
+                FunctionCode::SegmentBRequest,
+                FunctionCode::FinalDownloadRequest,
+                FunctionCode::VerifyRequest,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn asserting_a_profile_does_not_excuse_the_artifact() {
+        // Naming the profile replaces the identity read and nothing else.
+        let bytes = make_image(0xAAAA_0001, 0x2025_1209, 0x1000_C000, 16, true);
+        let artifact = ImgArtifact::parse(&bytes, ImgLimits::default()).unwrap();
+        assert!(AssertedTarget::assert(&motor_4310(), artifact).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_disabled_profile_cannot_be_asserted() {
+        let target = RegisteredTarget::disabled(
+            "compatible-motor-4360-v1",
+            0x4859_444C,
+            0xAAAA_0005,
+            "not qualified",
+        )
+        .unwrap();
+        let bytes = make_image(0xAAAA_0001, 0x2025_1025, 0x1000_C000, 16, true);
+        let artifact = ImgArtifact::parse(&bytes, ImgLimits::default()).unwrap();
+        assert!(matches!(
+            AssertedTarget::assert(&target, artifact),
+            Err(PolicyError::ProfileChanged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_still_refuses_an_unaddressable_node() {
+        let bus = FakeBus::new(None, None);
+        let error = recover(
+            &bus,
+            0,
+            &asserted(16),
+            &fast_options(),
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, FlashError::InvalidNode(0)));
         assert!(bus.requests().is_empty());
     }
 }

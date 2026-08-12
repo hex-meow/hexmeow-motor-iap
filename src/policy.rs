@@ -91,7 +91,7 @@ impl IapPolicy {
         self.require_encrypted
     }
 
-    fn validate_artifact(&self, artifact: &ImgArtifact) -> Result<(), PolicyError> {
+    pub(crate) fn validate_artifact(&self, artifact: &ImgArtifact) -> Result<(), PolicyError> {
         if artifact.device_id() != self.device_id {
             return Err(PolicyError::DeviceMismatch {
                 expected: self.device_id,

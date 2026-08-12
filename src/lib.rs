@@ -9,7 +9,8 @@ mod wire;
 
 pub use artifact::{ArtifactError, EncryptionMode, ImgArtifact, ImgLimits, IMG_TAG_SIZE};
 pub use engine::{
-    flash, CancellationToken, FlashError, FlashEvent, FlashOptions, FlashOutcome, FlashStage,
+    flash, recover, AssertedTarget, CancellationToken, FlashError, FlashEvent, FlashOptions,
+    FlashOutcome, FlashStage,
 };
 pub use identity::{CanopenIdentity, IapIdentity, IdentityError};
 pub use policy::{

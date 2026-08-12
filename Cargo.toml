@@ -11,7 +11,7 @@ keywords = ["can", "canopen", "firmware", "dfu", "iap"]
 categories = ["embedded", "hardware-support"]
 
 [dependencies]
-can-transport = { version = "0.1.3", default-features = false }
+can-transport = { version = "0.1.4", default-features = false }
 crc = "3"
 sha2 = "0.10"
 thiserror = "2"
