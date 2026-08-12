@@ -59,15 +59,22 @@ pub enum FlashEvent {
 
 #[derive(Debug, Clone)]
 pub struct FlashOptions {
-    pub reboot_delay: Duration,
+    /// Quiet time after `Reset_Ack` before the first Enter-IAP knock. Purely an
+    /// optimization: knocking during the reboot is harmless but wasted.
+    pub knock_start_delay: Duration,
+    /// Gap between Enter-IAP knocks, which is also how long each knock listens
+    /// for its answer.
+    pub knock_interval: Duration,
+    /// How long to keep knocking, measured from the first knock. Must outlast
+    /// the bootloader's own timeout so a missed window is reported as such
+    /// rather than mistaken for a dead device.
+    pub knock_window: Duration,
     pub reset_timeout: Duration,
-    pub enter_timeout: Duration,
     pub start_timeout: Duration,
     pub segment_timeout: Duration,
     pub final_timeout: Duration,
     pub verify_timeout: Duration,
     pub reset_attempts: u8,
-    pub enter_attempts: u8,
     pub tx_burst_frames: usize,
     pub tx_burst_pause: Duration,
 }
@@ -75,15 +82,21 @@ pub struct FlashOptions {
 impl Default for FlashOptions {
     fn default() -> Self {
         Self {
-            reboot_delay: Duration::from_millis(700),
+            // Measured on Meow Motor (0x4859444C/0xAAAA0001, revisions 9 and
+            // 10): the bootloader starts answering Enter_Iap_Req ~1184 ms after
+            // Reset_Req and jumps to the application ~2397 ms after it, so the
+            // window is only ~1.2 s wide and does not contain the 700 ms single
+            // shot the vendor documents. Knocking from 400 ms to 3500 ms covers
+            // it with wide margin at both ends.
+            knock_start_delay: Duration::from_millis(400),
+            knock_interval: Duration::from_millis(25),
+            knock_window: Duration::from_millis(3500),
             reset_timeout: Duration::from_secs(3),
-            enter_timeout: Duration::from_secs(3),
             start_timeout: Duration::from_secs(20),
             segment_timeout: Duration::from_secs(3),
             final_timeout: Duration::from_secs(20),
             verify_timeout: Duration::from_secs(20),
             reset_attempts: 2,
-            enter_attempts: 3,
             tx_burst_frames: 15,
             tx_burst_pause: Duration::from_millis(1),
         }
@@ -213,23 +226,15 @@ where
     )
     .await?;
     require_success(reset_ack, FlashStage::Resetting, false)?;
-    tokio::time::sleep(options.reboot_delay).await;
 
     check_cancel(cancellation, FlashStage::EnteringBootloader, false)?;
-    let enter = Frame::request(node_id, FunctionCode::EnterIapRequest, Vec::new())
-        .expect("validated node and protocol constant");
-    let enter_ack = send_with_attempts(
+    let enter_ack = knock_into_iap(
         bus,
         rx.as_mut(),
         &mut assembler,
-        &enter,
-        AttemptPolicy {
-            stage: FlashStage::EnteringBootloader,
-            timeout: options.enter_timeout,
-            attempts: options.enter_attempts,
-            ambiguous_is_recovery: false,
-        },
+        node_id,
         options,
+        cancellation,
         &mut on_event,
     )
     .await?;
@@ -356,7 +361,7 @@ where
 }
 
 fn validate_options(options: &FlashOptions) -> Result<(), FlashError> {
-    if options.reset_attempts == 0 || options.enter_attempts == 0 {
+    if options.reset_attempts == 0 {
         return Err(FlashError::InvalidOptions(
             "attempt counts must be non-zero",
         ));
@@ -366,7 +371,78 @@ fn validate_options(options: &FlashOptions) -> Result<(), FlashError> {
             "tx_burst_frames must be non-zero",
         ));
     }
+    if options.knock_interval.is_zero() {
+        return Err(FlashError::InvalidOptions(
+            "knock_interval must be non-zero",
+        ));
+    }
     Ok(())
+}
+
+/// Enter IAP by knocking repeatedly instead of guessing one reboot delay.
+///
+/// The bootloader accepts `Enter_Iap_Req` only between finishing its own reset
+/// and timing out into the application. A single delayed shot has to guess both
+/// edges of that window; measured hardware opens it far later than the vendor's
+/// documented 700 ms and closes it well before a 3 s ACK timeout would expire,
+/// so the documented sequence cannot hit it at all. Knocking covers the window
+/// wherever it happens to fall.
+///
+/// `Enter_Iap_Req` erases nothing and the device answers every knock once it is
+/// in IAP, so repeating it is safe. Sends are best-effort on purpose: for most
+/// of this window the target is still resetting, and when it is the only other
+/// node on the bus nothing acknowledges the frame, which surfaces here as a
+/// transport error that must not end the session.
+async fn knock_into_iap<F>(
+    bus: &dyn CanBus,
+    rx: &mut dyn CanRx,
+    assembler: &mut FrameAssembler,
+    node_id: u8,
+    options: &FlashOptions,
+    cancellation: &CancellationToken,
+    on_event: &mut F,
+) -> Result<Frame, FlashError>
+where
+    F: FnMut(FlashEvent),
+{
+    let request = Frame::request(node_id, FunctionCode::EnterIapRequest, Vec::new())
+        .expect("validated node and protocol constant");
+    let stage = FlashStage::EnteringBootloader;
+    assembler.reset();
+    on_event(FlashEvent::Stage(stage));
+    tokio::time::sleep(options.knock_start_delay).await;
+
+    let deadline = tokio::time::Instant::now() + options.knock_window;
+    loop {
+        check_cancel(cancellation, stage, false)?;
+        let _ = send_frame(bus, &request, stage, false, options).await;
+
+        let now = tokio::time::Instant::now();
+        let listen = options
+            .knock_interval
+            .min(deadline.saturating_duration_since(now));
+        match receive_expected(
+            rx,
+            assembler,
+            node_id,
+            FunctionCode::EnterIapAck,
+            listen,
+            stage,
+        )
+        .await
+        {
+            Ok(frame) => return Ok(frame),
+            Err(FlashError::AckTimeout { .. }) => {}
+            Err(error) => return Err(error),
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(FlashError::AckTimeout {
+                stage,
+                recovery_required: false,
+            });
+        }
+    }
 }
 
 fn check_cancel(
@@ -574,6 +650,8 @@ mod tests {
         receiver_tx: Mutex<Option<mpsc::UnboundedSender<CanFrame>>>,
         drop_ack: Option<FunctionCode>,
         nak: Option<FunctionCode>,
+        /// Enter-IAP knocks to swallow before the bootloader window "opens".
+        deaf_knocks: Mutex<usize>,
     }
 
     impl FakeBus {
@@ -584,7 +662,13 @@ mod tests {
                 receiver_tx: Mutex::new(None),
                 drop_ack,
                 nak,
+                deaf_knocks: Mutex::new(0),
             }
+        }
+
+        fn deaf_for(self, knocks: usize) -> Self {
+            *self.deaf_knocks.lock().unwrap() = knocks;
+            self
         }
 
         fn requests(&self) -> Vec<FunctionCode> {
@@ -601,6 +685,13 @@ mod tests {
                 self.requests.lock().unwrap().push(request.function());
                 if self.drop_ack == Some(request.function()) {
                     continue;
+                }
+                if request.function() == FunctionCode::EnterIapRequest {
+                    let mut deaf = self.deaf_knocks.lock().unwrap();
+                    if *deaf > 0 {
+                        *deaf -= 1;
+                        continue;
+                    }
                 }
                 let function = request.function().expected_ack().unwrap();
                 let data = if function == FunctionCode::EnterIapAck {
@@ -684,15 +775,15 @@ mod tests {
 
     fn fast_options() -> FlashOptions {
         FlashOptions {
-            reboot_delay: Duration::ZERO,
+            knock_start_delay: Duration::ZERO,
+            knock_interval: Duration::from_millis(5),
+            knock_window: Duration::from_millis(50),
             reset_timeout: Duration::from_millis(5),
-            enter_timeout: Duration::from_millis(5),
             start_timeout: Duration::from_millis(5),
             segment_timeout: Duration::from_millis(5),
             final_timeout: Duration::from_millis(5),
             verify_timeout: Duration::from_millis(5),
             reset_attempts: 1,
-            enter_attempts: 1,
             tx_burst_frames: 15,
             tx_burst_pause: Duration::ZERO,
         }
@@ -728,6 +819,53 @@ mod tests {
             written: 300,
             total: 300,
         }));
+    }
+
+    #[tokio::test]
+    async fn enter_iap_keeps_knocking_until_the_bootloader_window_opens() {
+        // A device that ignores the first five knocks still gets entered: the
+        // single documented shot at a fixed reboot delay would have missed it.
+        let bus = FakeBus::new(None, None).deaf_for(5);
+        flash(
+            &bus,
+            ready(16),
+            &fast_options(),
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let knocks = bus
+            .requests()
+            .iter()
+            .filter(|function| **function == FunctionCode::EnterIapRequest)
+            .count();
+        assert_eq!(knocks, 6);
+    }
+
+    #[tokio::test]
+    async fn a_window_that_never_opens_fails_before_anything_destructive() {
+        let bus = FakeBus::new(None, None).deaf_for(usize::MAX);
+        let error = flash(
+            &bus,
+            ready(16),
+            &fast_options(),
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            FlashError::AckTimeout {
+                stage: FlashStage::EnteringBootloader,
+                recovery_required: false,
+            }
+        ));
+        assert!(bus.requests().iter().all(|function| matches!(
+            function,
+            FunctionCode::ResetRequest | FunctionCode::EnterIapRequest
+        )));
     }
 
     #[tokio::test]
